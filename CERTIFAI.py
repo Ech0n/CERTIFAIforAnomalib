@@ -157,11 +157,20 @@ class CERTIFAI:
         return len(con)/x.shape[-1]*con_distance + len(cat)/x.shape[-1]*cat_distance
     
     def img_distance(self, x, y):
-        
         distances = []
         
         for counterfact in y:
-            distances.append(SSIM(x, counterfact))
+            if counterfact.shape != x.shape:
+                if(counterfact.shape == x[0].shape):
+                    distances.append(SSIM(x[0], counterfact))
+                elif (counterfact[0].shape == x.shape):
+                    distances.append(SSIM(x, counterfact[0]))
+                elif (counterfact.shape == x.iloc[0].shape):
+                    distances.append(SSIM(x.iloc[0], counterfact, data_range=100 ))
+                else:
+                    raise Exception("mismatch in shapes")
+            else:
+                distances.append(SSIM(x, counterfact))
         
         return np.array(distances).reshape(1,-1)
             
@@ -226,7 +235,7 @@ class CERTIFAI:
             raise ValueError('Distance function specified not recognised:\
                              use one of automatic, L1, SSIM, L2 or euclidean.')
         
-    def set_population(self, x=None):
+    def set_population(self, x=None, max_pop=10):
         """Set the population limit (i.e. number of counterfactuals created at each generation).
         following the original paper, we define the maximum population as the minum between the squared number of features
         to be generated and 30000.
@@ -246,9 +255,9 @@ class CERTIFAI:
             x = self.tab_dataset
         
         if len(x.shape)>2:
-            self.Population = min(sum(x.shape[1:])**2, 30000)
+            self.Population = min(sum(x.shape[1:])**2, max_pop)
         else:
-            self.Population = min(x.shape[-1]**2, 30000)
+            self.Population = min(x.shape[-1]**2, max_pop)
         
     def set_constraints(self, x = None, fixed = None):
         '''Set the list of constraints for each input feature, whereas
@@ -277,8 +286,14 @@ class CERTIFAI:
         
         if x is None:
             x = self.tab_dataset
-        
         if len(x.shape)>2:
+            self.org_shape = x.shape
+            channel_size = self.org_shape[-1] * self.org_shape[-2]
+            self.channel_ranges = [
+                (0, channel_size),           # R channel columns
+                (channel_size, 2*channel_size),  # G channel columns
+                (2*channel_size, 3*channel_size) # B channel columns
+            ]
             x = self.tab_dataset if self.tab_dataset is not None else x.copy()
             
             x = pd.DataFrame(x.reshape(x.shape[0], -1))
@@ -286,13 +301,19 @@ class CERTIFAI:
         if isinstance(x, pd.DataFrame):
             for i in x:
                 if i in fixed_feats:
-                    # Placeholder if the feature needs to be kept fixed in generating counterfactuals
                     self.constraints.append(i)
-                # Via a dataframe is also possible to constran categorical fatures (not supported for numpy array)
                 elif x.loc[:,i].dtype == 'O':
                     self.constraints.append((0, len(pd.unique(x.loc[:,i]))))
+                   
                 else:
-                    self.constraints.append((min(x.loc[:,i]), max(x.loc[:,i])))
+                    for ch_idx, (start, end) in enumerate(self.channel_ranges):
+                        if start <= i < end:
+                            self.constraints.append((self.minX[ch_idx], self.maxX[ch_idx]))
+                            break
+                    else:
+                        print("candidate fallback")
+                        # Fallback if column is outside R/G/B (unlikely in your case)
+                        self.constraints.append((np.min(x.values), np.max(x.values)))
         
         else:
             assert x is not None, 'A numpy array should be provided to get min-max values of each column,\
@@ -304,7 +325,7 @@ class CERTIFAI:
                     self.constraints.append(i)
                 else:
                     self.constraints.append((min(x[:,i]), max(x[:, i])))
-                
+        
         
     
     def transform_x_2_input(self, x, pytorch = True):
@@ -323,32 +344,57 @@ class CERTIFAI:
             Outputs:
                 transformed_x (torch.tensor or numpy.ndarray): the transformed
                 input, ready to be passed into the model.'''
-                
+        torch.cuda.empty_cache()
         if isinstance(x, pd.DataFrame):
             
             x = x.copy()
             
             con, cat = self.get_con_cat_columns(x)
             
-            if len(cat)>0:
-                
-                for feature in cat:
-                    
-                    enc = LabelEncoder()
-                    
-                    x[feature] = enc.fit(x[feature]).transform(x[feature])
-            
-            model_input = torch.tensor(x.values, dtype=torch.float) if pytorch else x.values
+            if x.shape!=self.org_shape:
+                y = x.to_numpy().reshape((x.shape[0],3,self.org_shape[-2],self.org_shape[-1]))
+                model_input = torch.tensor(y, dtype = torch.float32, device='cuda') if pytorch else x
+                return model_input
+
+            model_input = torch.tensor(x, dtype = torch.float32, device='cuda') if pytorch else x
             
         elif isinstance(x, np.ndarray):
-            
-            model_input = torch.tensor(x, dtype = torch.float) if pytorch else x
-            
+            model_input = torch.tensor(x, dtype = torch.float32, device='cuda') if pytorch else x
         else:
             raise ValueError("The input x must be a pandas dataframe or a numpy array")
             
         return model_input
-    
+    def batched_prediction(self, model, model_input, batch_size=64, pytorch=True, classification=True):
+
+        model.eval()
+        predictions = []
+
+        # Make sure model_input is on CPU; move batches to CUDA later
+        if not isinstance(model_input, torch.Tensor):
+            model_input = torch.tensor(model_input, dtype=torch.float32)
+
+        total_samples = model_input.shape[0]
+
+        with torch.no_grad():
+            for i in range(0, total_samples, batch_size):
+                batch = model_input[i:i+batch_size].to('cuda')
+
+                outputs = model(batch)["pred_score"].detach().cpu().numpy()
+
+                if classification:
+                    batch_preds = np.argmax(outputs, axis=-1)
+                else:
+                    batch_preds = outputs
+                
+                batch_preds = np.atleast_1d(batch_preds)
+                predictions.append(batch_preds)
+
+                # Clear memory
+                del batch, outputs, batch_preds
+                torch.cuda.empty_cache()
+
+        prediction = np.concatenate(predictions, axis=0)
+        return prediction
     def generate_prediction(self, model, model_input, pytorch=True, classification = True):
         '''Function to output prediction from a deep learning model
         
@@ -372,14 +418,18 @@ class CERTIFAI:
         if classification:
             if pytorch:
                 with torch.no_grad():
-                    prediction = np.argmax(model(model_input).numpy(), axis = -1)
+                    outputs = model(model_input)
+                    outputs = outputs["pred_score"].detach().cpu().numpy()
+                    prediction = np.argmax(outputs, axis=-1)
             else:
                 prediction = np.argmax(model.predict(model_input), axis = -1)
                 
         else:
             if pytorch:
                 with torch.no_grad():
-                    prediction = model(model_input).numpy()
+                    outputs = model(model_input)
+                    outputs = outputs["pred_score"].detach().cpu()
+                    prediction = outputs.numpy()
             else:
                 prediction = model.predict(model_input)
                 
@@ -415,7 +465,6 @@ class CERTIFAI:
                 
                 fitness_dict (dict): dictionary of fitness scores stored
                 by the relative counterfactual index.'''
-                
         gen_dict = {i:distance for i, 
                                 distance in enumerate(distances)}
                     
@@ -425,7 +474,6 @@ class CERTIFAI:
         selected_counterfacts = []
         
         k = 0
-        
         for key,value in gen_dict.items():
             
             if k==retain_k:
@@ -483,7 +531,7 @@ class CERTIFAI:
                                 constrained = True,
                                 has_cat = False,
                                 cat_ids = None,
-                                img = False):
+                                img = None):
         '''Function to generate the random (constrained or unconstrained)
         candidates for counterfactual generation if the input is a pandas
         dataframe (i.e. tabular data).
@@ -523,18 +571,20 @@ class CERTIFAI:
         if normalisation is None:
                             
             if constrained:
-                
+                constSize = (self.Population, 1)
                 generation = []
                 
                 temp = []
                 for constraint in self.constraints:
                     if not isinstance(constraint, tuple):
-                        # In this case the given feature is fixed
-                        temp.append(sample.loc[:,constraint].values)
+                        ttt = sample.loc[:,constraint].values
+                        fixed_values = np.array( [ttt for _ in range(self.Population)])
+                        temp.append(fixed_values)
+                        if fixed_values.shape != constSize:
+                            print(f"WRONG SIZE\n    expected: {constSize}\n     got: {fixed_values.shape}")
                     else:
-                        temp.append(np.random.randint(constraint[0]*100, (constraint[1]+1)*100,
-                                                      size = (self.Population, 1))/100
-                                    )
+                        randomValue = np.random.uniform(low=constraint[0], high=constraint[1], size=constSize)
+                        temp.append(randomValue)
                 
                 generation = np.concatenate(temp, axis = -1)
                 
@@ -580,16 +630,23 @@ class CERTIFAI:
             generation = generation
         
         else:
-            distances = self.distance(sample, generation)[0]
-            
+            if img is None:
+                distances = self.distance(sample, generation)[0]
+            else:
+                distances = self.distance(img, generation)[0]
+                
             generation = generation.tolist()
         
             generation = pd.DataFrame(generation)
-        
-        for i in sample:
-            generation[i] = generation[i].astype(sample[i].dtype)
-        
-        
+
+        if sample.dtypes.nunique() == 1:
+            common_dtype = sample.dtypes.iloc[0]
+            generation = generation.astype(common_dtype)
+        else:
+            
+            for i in tqdm(sample, desc="Generating samples"):
+                generation[i] = generation[i].astype(sample[i].dtype)
+
         return generation.values.tolist(), distances
                     
     
@@ -604,7 +661,6 @@ class CERTIFAI:
             Output:
                 mutated_counterfacts (numpy.ndarray): the mutated candidate
                 counterfactuals.'''
-        
         nfeats = len(counterfacts_list[0])
         
         dtypes = [type(feat) for feat in counterfacts_list[0]]
@@ -614,23 +670,30 @@ class CERTIFAI:
         random_indeces = np.random.binomial(1, self.Pm, len(counterfacts_list))
         
         mutation_indeces = [index for index, i in enumerate(random_indeces) if i]
-        
-        for index in mutation_indeces:
-            mutation_features = np.random.randint(0, nfeats, 
-                                                  size = np.random.randint(1, nfeats))
+        column_data = [counterfacts_df.iloc[:, i].values for i in range(counterfacts_df.shape[1])]
+
+        for index in tqdm(mutation_indeces):
             
+            column_is_string = [isinstance(counterfacts_df.iloc[0, i], str) for i in range(nfeats)]
+            column_uniques = [np.unique(counterfacts_df.iloc[:, i]) if is_str else None
+                            for i, is_str in enumerate(column_is_string)]
+
+            k = np.random.randint(1, nfeats)
+            mutation_features = np.random.choice(nfeats, size=k, replace=False)
+
+            # Process each feature index
             for feat_ind in mutation_features:
-                if isinstance(counterfacts_df.iloc[0, feat_ind], str):
-                    counterfacts_df.iloc[index, feat_ind] = np.random.choice(
-                        np.unique(counterfacts_df.iloc[:, feat_ind]))
-                    
+                if column_is_string[feat_ind]:
+                    new_val = np.random.choice(column_uniques[feat_ind])
                 else:
-                    counterfacts_df.iloc[index, feat_ind] = 0.5*(
-                        np.random.choice(counterfacts_df.iloc[:, feat_ind]) +
-                    np.random.choice(counterfacts_df.iloc[:, feat_ind]))
-        
-        for index, key in enumerate(counterfacts_df):
-            counterfacts_df[key] = counterfacts_df[key].astype(dtypes[index])
+                    col_vals = column_data[feat_ind]
+                    rand_vals = np.random.choice(col_vals, size=2)
+                    new_val =  0.5 * (rand_vals[0] + rand_vals[1])
+
+                counterfacts_df.iat[index, feat_ind] = new_val
+            
+        counterfacts_df = counterfacts_df.astype(dict(zip(counterfacts_df.columns, dtypes)))
+
         
         return counterfacts_df.values.tolist()
     
@@ -677,9 +740,10 @@ class CERTIFAI:
             return counterfacts_df
         
         return counterfacts_df.values.tolist()
-    
-    def fit(self, 
+
+    def fit_with_good_reference(self, 
             model,
+            good_ref,
             x = None,
             model_input = None,
             pytorch = True,
@@ -693,6 +757,7 @@ class CERTIFAI:
             final_k = 1,
             normalisation = None,
             fixed = None,
+            max_population=10,
             verbose = False):
         '''Generate the counterfactuals for the defined dataset under the
         trained model. The whole process is described in detail in the
@@ -788,18 +853,281 @@ class CERTIFAI:
             assert self.tab_dataset is not None, 'Either an input is passed into\
             the function or a the class needs to be instantiated with the path\
                 to the csv file containing the dataset'
-            
             x = self.tab_dataset
             
         else:
             
             x = x.copy() 
             
+        self.minX = np.min(x[0], axis=(1, 2))
+        self.maxX = np.max(x[0], axis=(1, 2))
+        flat_img = x.reshape(-1, 3)
+        low_percentile = 5
+        
+        high_percentile = 55
+        min_vals = np.percentile(flat_img, low_percentile, axis=0)
+        max_vals = np.percentile(flat_img, high_percentile, axis=0)
+        self.minX = np.percentile(flat_img, low_percentile, axis=0)
+        self.maxX = np.percentile(flat_img, high_percentile, axis=0)
         if self.constraints is None:
                 self.set_constraints(x, fixed)
             
         if self.Population is None:
-                self.set_population(x)
+                self.set_population(x,max_pop = max_population)
+                
+        if self.distance is None:
+                self.set_distance(distance, x)
+                
+        if model_input is None:
+            model_input = self.transform_x_2_input(x, pytorch = pytorch)
+            
+        if torch:
+            model.eval()
+        
+        if self.predictions is None: 
+            self.predictions = self.batched_prediction(model, model_input,
+                                                  pytorch = pytorch,
+                                                  classification = classification)
+            
+        if len(x.shape)>2:
+            self.org_shape = x.shape
+            channel_size = self.org_shape[-1] * self.org_shape[-2]
+            self.channel_ranges = [
+                (0, channel_size),           # R channel columns
+                (channel_size, 2*channel_size),  # G channel columns
+                (2*channel_size, 3*channel_size) # B channel columns
+            ]
+            #flatten
+            x = x.reshape(x.shape[0], -1)
+        good_ref = pd.DataFrame( good_ref.reshape(good_ref.shape[0],-1))
+        self.results = []
+        
+        if isinstance(x, pd.DataFrame):
+                
+            con, cat = self.get_con_cat_columns(x)
+            
+            has_cat = True if len(cat)>0 else False
+            
+            cat_ids = None
+            
+            if has_cat:
+                cat_ids = self.generate_cats_ids(x)
+        
+        else:
+            x = pd.DataFrame(x)   
+            has_cat = False
+            cat_ids = None
+            # x = pd.DataFrame(x)   
+        
+        if classification and class_specific is not None:
+            x = x.iloc[self.predictions == class_specific]
+            self.class_specific = class_specific
+                
+                
+               
+        tot_samples = tqdm(range(x.shape[0])) if verbose else range(x.shape[0])
+        
+        
+        num_it = len(tot_samples)
+        it = 0
+        for i in tot_samples:
+            if verbose:
+                tot_samples.set_description('Generating counterfactual(s) for sample %s' % i)
+            
+            sample = x.iloc[i:i+1,:]
+            counterfacts = []
+            
+            counterfacts_fit = {}
+            
+            for g in range(generations):
+                print(f"generation: {(it*generations)+g} / {num_it*generations}")
+                print(f"start of generation {g}")
+                generation, distances = self.generate_candidates_tab(sample,
+                                                                normalisation,
+                                                                constrained,
+                                                                has_cat,
+                                                                cat_ids,
+                                                                img=good_ref)
+
+                selected_generation, _ = self.generate_counterfacts_list_dictionary(
+                    counterfacts_list = generation,
+                    distances = distances, 
+                    fitness_dict = {},
+                    retain_k = select_retain, 
+                    start=0)
+                
+                selected_generation = np.array(selected_generation)
+                
+                mutated_generation = self.mutate(selected_generation)
+
+                crossed_generation = self.crossover(mutated_generation, 
+                                                    return_df = True)
+                gen_input = self.transform_x_2_input(crossed_generation,
+                                                     pytorch = pytorch)
+                counter_preds = self.batched_prediction(model, gen_input, pytorch,
+                                                         classification)
+               
+                diff_prediction = [counter_pred!=self.predictions[it] for
+                                   counter_pred in counter_preds]
+                
+                final_generation = crossed_generation.loc[diff_prediction]
+                
+                final_distances = self.distance(good_ref, final_generation.to_numpy())[0]
+                
+                final_generation, counterfacts_fit = self.generate_counterfacts_list_dictionary(
+                    counterfacts_list = final_generation.values.tolist(),
+                    distances = final_distances, 
+                    fitness_dict = counterfacts_fit,
+                    retain_k = gen_retain, 
+                    start = len(counterfacts_fit))
+                
+                counterfacts.extend(final_generation)
+                assert len(counterfacts)==len(counterfacts_fit), 'Something went wrong: len(counterfacts): {}, len(counterfacts_fit): {}'.format(len(counterfacts), len(counterfacts_fit))
+            it+=1
+            
+            counterfacts, fitness_dict = self.generate_counterfacts_list_dictionary(
+                    counterfacts_list = counterfacts,
+                    distances = list(counterfacts_fit.values()), 
+                    fitness_dict = {},
+                    retain_k = final_k, 
+                    start = 0)
+            
+            self.results = (sample, counterfacts, list(fitness_dict.values()))
+            
+    def fit(self, 
+            model,
+            x = None,
+            model_input = None,
+            pytorch = True,
+            classification = True,
+            generations = 3, 
+            distance = 'automatic',
+            constrained = True,
+            class_specific = None,
+            select_retain = 1000,
+            gen_retain = 500,
+            final_k = 1,
+            normalisation = None,
+            fixed = None,
+            max_population=10,
+            verbose = False):
+        '''Generate the counterfactuals for the defined dataset under the
+        trained model. The whole process is described in detail in the
+        original paper.
+        
+        Arguments:
+            Inputs:
+                model (torch.nn.module, keras.model or sklearn.model): the trained model
+                that will be used to check that original samples and their
+                counterfactuals yield different predictins.
+                
+                x (pandas.DataFrame or numpy.ndarray): the referenced 
+                dataset, i.e. the samples for which creating counterfactuals.
+                If no dataset is provided, the function assumes that the 
+                dataset has been previously provided to the class during
+                instantiation (see above) and that it is therefore contained
+                in the attribute 'tab_dataset'.
+                
+                model_input (torch.tensor or numpy.ndarray): the dataset
+                for which counterfactuals are generated, but having the form
+                required by the trained model to generate predictions based
+                on it. If nothing is provided, the model input will be automatically
+                generated for each dataset's observation (following the torch
+                argument in order to create the correct input).
+                
+                pytorch (bool): whether the passed model is a torch.nn.module
+                instance (if pytorch is set to True) or a keras/sklearn.model one.
+                
+                classification (bool): whether the task of the model is to 
+                classify (classification = True) or to perform regression.
+                
+                generations (int): the number of generations, i.e. how many
+                times the algorithm will run over each data sample in order to 
+                generate the relative counterfactuals. In the original paper, the
+                value of this parameter was found for each separate example via
+                grid search. Computationally, increasing the number of generations
+                linearly increases the time of execution.
+                
+                distance (str): the type of distance function to be used in
+                comparing original samples and counterfactuals. The default
+                is "automatic", meaning that the distance function will be guessed,
+                based on the form of the input data. Other options are 
+                "SSIM" (for images), "L1" or "L2".
+                
+                constrained (bool): whether to constrain the values of each
+                generated feature to be in the range of the observed values
+                for that feature in the original dataset.
+                
+                class_specific (int): if classification is True, this option
+                can be used to further specify that we want to generate 
+                counterfactuals just for samples yielding a particular prediction
+                (whereas the relative integer is the index of the predicted class
+                 according to the trained model). This is useful, e.g., if the 
+                analysis needs to be restricted on data yielding a specific
+                prediction. Default is None, meaning that all data will be used
+                no matter what prediction they yield.
+                
+                select_retain (int): hyperparameter specifying the (max) amount
+                of counterfactuals to be retained after the selection step
+                of the algorithm.
+                
+                gen_retain (int): hyperparameter specifying the (max) amount
+                of counterfactuals to be retained at each generation.
+                
+                final_k (int): hyperparameter specifying the (max) number
+                of counterfactuals to be kept for each data sample.
+                
+                normalisation (str) ["standard", "max_scaler"]: the
+                normalisation technique used for the data at hand. Default
+                is None, while "standard" and "max_scaler" techniques are
+                the other possible options. According to the chosen value
+                different random number generators are used. This option is
+                useful to speed up counterfactuals' generation if the original
+                data underwent some normalisation process or are in some
+                specific range.
+                
+                fixed (list): a list of features to be kept fixed in counterfactual generation 
+                (i.e. all counterfactual will have the same value as the given sample for that
+                feature). If no list is provided, then no feature will be kept fixed.
+            
+                verbose (bool): whether to print the generation status via 
+                a progression bar.
+                
+            Outputs
+                None: the function does not output any value but it populates
+                the result attribute of the instance with a list of tuples each
+                containing the original data sample, the generated  counterfactual(s)
+                for that data sample and their distance(s).
+        '''
+        
+        
+        if x is None:
+            assert self.tab_dataset is not None, 'Either an input is passed into\
+            the function or a the class needs to be instantiated with the path\
+                to the csv file containing the dataset'
+            x = self.tab_dataset
+            
+        else:
+            
+            x = x.copy() 
+        
+        self.minX = np.min(x[0], axis=(1, 2))
+        self.maxX = np.max(x[0], axis=(1, 2))
+        if(type(x)== np.ndarray):
+            flat_img = x.reshape(-1, 3)
+            low_percentile = 5
+            
+            high_percentile = 55
+            min_vals = np.percentile(flat_img, low_percentile, axis=0)
+            max_vals = np.percentile(flat_img, high_percentile, axis=0)
+            self.minX = np.percentile(flat_img, low_percentile, axis=0)
+            self.maxX = np.percentile(flat_img, high_percentile, axis=0)
+            
+        if self.constraints is None:
+                self.set_constraints(x, fixed)
+            
+        if self.Population is None:
+                self.set_population(x,max_pop = max_population)
                 
         if self.distance is None:
                 self.set_distance(distance, x)
@@ -814,9 +1142,16 @@ class CERTIFAI:
             self.predictions = self.generate_prediction(model, model_input,
                                                   pytorch = pytorch,
                                                   classification = classification)
-        
-        if len(x.shape)>2:
             
+        if len(x.shape)>2:
+            self.org_shape = x.shape
+            channel_size = self.org_shape[-1] * self.org_shape[-2]
+            self.channel_ranges = [
+                (0, channel_size),           # R channel columns
+                (channel_size, 2*channel_size),  # G channel columns
+                (2*channel_size, 3*channel_size) # B channel columns
+            ]
+            #flatten
             x = x.reshape(x.shape[0], -1)
         
         self.results = []
@@ -833,9 +1168,10 @@ class CERTIFAI:
                 cat_ids = self.generate_cats_ids(x)
         
         else:
-             x = pd.DataFrame(x)   
-        
-        
+            x = pd.DataFrame(x)   
+            has_cat = False
+            cat_ids = None
+            # x = pd.DataFrame(x)   
         
         if classification and class_specific is not None:
             x = x.iloc[self.predictions == class_specific]
@@ -845,26 +1181,27 @@ class CERTIFAI:
                
         tot_samples = tqdm(range(x.shape[0])) if verbose else range(x.shape[0])
         
-        
+        num_it = len(tot_samples)
+        it = 0
         for i in tot_samples:
-            
             if verbose:
                 tot_samples.set_description('Generating counterfactual(s) for sample %s' % i)
             
             sample = x.iloc[i:i+1,:]
-            
             counterfacts = []
             
             counterfacts_fit = {}
             
             for g in range(generations):
-            
+                print(f"generation: {(it*generations)+g} / {num_it*generations}")
+                print(f"start of generation {g}")
                 generation, distances = self.generate_candidates_tab(sample,
                                                                 normalisation,
                                                                 constrained,
                                                                 has_cat,
                                                                 cat_ids)
-                    
+
+
                 selected_generation, _ = self.generate_counterfacts_list_dictionary(
                     counterfacts_list = generation,
                     distances = distances, 
@@ -875,24 +1212,23 @@ class CERTIFAI:
                 selected_generation = np.array(selected_generation)
                 
                 mutated_generation = self.mutate(selected_generation)
-                
+
                 crossed_generation = self.crossover(mutated_generation, 
                                                     return_df = True)
-                
                 gen_input = self.transform_x_2_input(crossed_generation,
                                                      pytorch = pytorch)
-                
                 counter_preds = self.generate_prediction(model,
                                                          gen_input,
                                                          pytorch,
                                                          classification)
-                
-                diff_prediction = [counter_pred!=self.predictions[g] for
+                diff_prediction = [counter_pred!=self.predictions[it] for
                                    counter_pred in counter_preds]
                 
                 final_generation = crossed_generation.loc[diff_prediction]
                 
-                final_distances = self.distance(sample, final_generation)[0]
+
+                final_distances = self.distance(sample, final_generation.to_numpy())[0]
+                
                 
                 final_generation, counterfacts_fit = self.generate_counterfacts_list_dictionary(
                     counterfacts_list = final_generation.values.tolist(),
@@ -902,8 +1238,9 @@ class CERTIFAI:
                     start = len(counterfacts_fit))
                 
                 counterfacts.extend(final_generation)
-                
+                print(f"end of generation {g}")
                 assert len(counterfacts)==len(counterfacts_fit), 'Something went wrong: len(counterfacts): {}, len(counterfacts_fit): {}'.format(len(counterfacts), len(counterfacts_fit))
+            it+=1
             
             counterfacts, fitness_dict = self.generate_counterfacts_list_dictionary(
                     counterfacts_list = counterfacts,
@@ -912,8 +1249,9 @@ class CERTIFAI:
                     retain_k = final_k, 
                     start = 0)
             
-            self.results.append((sample, counterfacts, list(fitness_dict.values())))
+            self.results = (sample, counterfacts, list(fitness_dict.values()))
             
+    
     def check_robustness(self, x = None, normalised = False):
         '''Calculate the Counterfactual-based Explanation for Robustness
         (CER) score or the normalised CER (NCER) if normalised argument is

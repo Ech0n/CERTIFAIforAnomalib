@@ -1,7 +1,10 @@
-numpy
+numpy==1.26.4
 pandas
-torch
-sklearn
-skimage
+scikit-learn
+scikit-image
 tqdm
+matplotlib
+PyQt5==5.15.10
 pytorch_lightning
+torch
+anomalib[full]==1.1.0
